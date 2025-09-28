@@ -70,8 +70,9 @@ def retrive_and_compose(
             Sample(
                 input=PROMPT,
                 metadata={
-                    "scores": {},
+                    "turns": {},
                     "cumsum": 0,
+                    "prev_cumsum_guess": 0,
                 },
             )
         ],
@@ -81,7 +82,13 @@ def retrive_and_compose(
             create_plan(n_turns, keys_per_turn, seed),
             play_turns(),
         ],
-        scorer=[max_turn_correct(), pct_turns_correct(), score_per_turn()],
+        scorer=[
+            max_turn_absolutely_correct(),
+            pct_turns_absolutely_correct(),
+            pct_turns_relatively_correct(),
+            turn_absolutely_correct(),
+            turn_relatively_correct(),
+        ],
     )
 
 
@@ -164,26 +171,56 @@ def play_turns():
         plan = state.metadata.get("plan")
         dictionary = state.metadata.get("dictionary")
 
-        for turn, keys in enumerate(plan, start=1):
-            # Add user message with the keys for the turn
-            state.messages.append(ChatMessageUser(content=f"{', '.join(keys)}"))
+        def calculate_error(correct_value, guess):
+            return abs(correct_value - guess) if guess != float("inf") else float("inf")
 
-            # Call the model
+        for turn, keys in enumerate(plan, start=1):
+            # Send keys to model and get response
+            state.messages.append(ChatMessageUser(content=f"{', '.join(keys)}"))
             await generate(state)
 
-            # Update cumulative sum and score the turn
-            state.metadata["cumsum"] += sum(dictionary[key] for key in keys)
-            correct_cumsum = state.metadata["cumsum"]
-            try:
-                guessed_cumsum = int(state.output.completion)
-            except ValueError:
-                guessed_cumsum = float("inf")  # will never equal correct_cumsum
+            # Calculate turn data
+            keys_dict = {key: dictionary[key] for key in keys}
+            keys_sum = sum(keys_dict.values())
 
-            state.metadata["scores"][str(turn)] = {
-                "is_correct": correct_cumsum == guessed_cumsum,
-                "correct_cumsum": correct_cumsum,
-                "guessed_cumsum": guessed_cumsum,
+            # Get previous state
+            prev_cumsum = state.metadata["cumsum"]
+            prev_cumsum_guess = state.metadata["prev_cumsum_guess"]
+
+            # Update cumulative sum and calculate targets
+            state.metadata["cumsum"] += keys_sum
+            absolute_cumsum = state.metadata["cumsum"]
+            relative_cumsum = prev_cumsum_guess + keys_sum
+
+            # Parse model's guess
+            try:
+                cumsum_guess = int(state.output.completion)
+            except ValueError:
+                cumsum_guess = float("inf")
+
+            # Store comprehensive turn data
+            state.metadata["turns"][turn] = {
+                "keys": keys_dict,
+                "score": {
+                    "keys_sum": keys_sum,
+                    "prev_cumsum": prev_cumsum,
+                    "prev_cumsum_guess": prev_cumsum_guess,
+                    "absolute_cumsum": absolute_cumsum,
+                    "relative_cumsum": relative_cumsum,
+                    "cumsum_guess": cumsum_guess,
+                    "is_absolutely_correct": absolute_cumsum == cumsum_guess,
+                    "is_relatively_correct": relative_cumsum == cumsum_guess,
+                    "absolute_cumsum_error": calculate_error(
+                        absolute_cumsum, cumsum_guess
+                    ),
+                    "relative_cumsum_error": calculate_error(
+                        relative_cumsum, cumsum_guess
+                    ),
+                },
             }
+
+            # Update for next turn
+            state.metadata["prev_cumsum_guess"] = cumsum_guess
 
         return state
 
@@ -199,11 +236,13 @@ def max_metric() -> Metric:
 
 
 @scorer(metrics=[max_metric()])
-def max_turn_correct():
+def max_turn_absolutely_correct():
     async def score(state: TaskState, target: Target) -> Score:
-        scores = state.metadata.get("scores", {})
+        turns = state.metadata.get("turns", {})
         correct_turns = [
-            int(turn) for turn, data in scores.items() if data["is_correct"]
+            turn
+            for turn, data in turns.items()
+            if data["score"]["is_absolutely_correct"]
         ]
         return Score(value=max(correct_turns, default=0))
 
@@ -211,23 +250,57 @@ def max_turn_correct():
 
 
 @scorer(metrics=[mean()])
-def pct_turns_correct():
+def pct_turns_absolutely_correct():
     async def score(state: TaskState, target: Target) -> Score:
-        scores = state.metadata.get("scores", {})
-        if not scores:
+        turns = state.metadata.get("turns", {})
+        if not turns:
             return Score(value=0.0)
         return Score(
-            value=sum(data["is_correct"] for data in scores.values()) / len(scores)
+            value=sum(data["score"]["is_absolutely_correct"] for data in turns.values())
+            / len(turns)
+        )
+
+    return score
+
+
+@scorer(metrics=[mean()])
+def pct_turns_relatively_correct():
+    async def score(state: TaskState, target: Target) -> Score:
+        turns = state.metadata.get("turns", {})
+        if not turns:
+            return Score(value=0.0)
+        return Score(
+            value=sum(data["score"]["is_relatively_correct"] for data in turns.values())
+            / len(turns)
         )
 
     return score
 
 
 @scorer(metrics=[])
-def score_per_turn():
+def turn_absolutely_correct():
     async def score(state: TaskState, target: Target) -> Score:
-        scores = state.metadata.get("scores", {})
-        return Score(value={turn: data["is_correct"] for turn, data in scores.items()})
+        turns = state.metadata.get("turns", {})
+        return Score(
+            value={
+                str(turn): data["score"]["is_absolutely_correct"]
+                for turn, data in turns.items()
+            }
+        )
+
+    return score
+
+
+@scorer(metrics=[])
+def turn_relatively_correct():
+    async def score(state: TaskState, target: Target) -> Score:
+        turns = state.metadata.get("turns", {})
+        return Score(
+            value={
+                str(turn): data["score"]["is_relatively_correct"]
+                for turn, data in turns.items()
+            }
+        )
 
     return score
 
@@ -235,20 +308,15 @@ def score_per_turn():
 if __name__ == "__main__":
     params = {
         "dictionary_size": [
-            5,
             100,
-            1_000,
         ],  # [5, 10, 50, 100, 250, 500, 1_000, 10_000],
-        "key_length": [5, 50, 500],  # [1, 2, 3, 5, 10, 25, 50, 100],
+        "key_length": [5],  # [1, 2, 3, 5, 10, 25, 50, 100],
         "int_range": [
             (-99, 99),
-            (-9_999, 9_999),
         ],  # [(-10, 10), (-99, 99), (-999, 999), (-9_999, 9_999)],
-        "n_turns": [10_000],
+        "n_turns": [1_000],
         "keys_per_turn": [
             1,
-            5,
-            50,
         ],  # [1, 2, 3, 5, 10, 25, 50, 100, 500, 1_000, 10_000],
         "seed": [42],
     }
@@ -286,8 +354,9 @@ if __name__ == "__main__":
             # "openai/gpt-5-2025-08-07",
         ],
         log_dir=f"logs/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}",
-        max_tasks=60,
-        max_connections=60,
+        epochs=3,
+        max_tasks=30,
+        max_connections=30,
         max_tokens=16,  # OAI minimum
         reasoning_tokens=None,  # disable thinking for Anthropic models
         reasoning_effort="minimal",
